@@ -719,52 +719,99 @@ lo_server lo_server_new_with_proto_internal(const char *group,
 int lo_server_join_multicast_group(lo_server s, const char *group,
                                    int fam, const char *iface, const char *ip)
 {
-    struct ip_mreq mreq;
-    memset(&mreq, 0, sizeof(mreq));
 
-    // TODO ipv6 support here
-
-    if (fam==AF_INET) {
+    switch(fam) {
+    case AF_INET: {
+      struct ip_mreq mreq;
+      memset(&mreq, 0, sizeof(mreq));
 #ifdef HAVE_INET_PTON
-        if (inet_pton(AF_INET, group, &mreq.imr_multiaddr) == 0) {
-            int err = geterror();
-            lo_throw(s, err, strerror(err), "inet_aton()");
-            lo_server_free(s);
-            return err ? err : 1;
-        }
-#else
-        mreq.imr_multiaddr.s_addr = inet_addr(group);
-        if (mreq.imr_multiaddr.s_addr == INADDR_ANY
-            || mreq.imr_multiaddr.s_addr == INADDR_NONE) {
-            int err = geterror();
-            lo_throw(s, err, strerror(err), "inet_addr()");
-            lo_server_free(s);
-            return err ? err : 1;
-        }
-#endif
-    }
-#if defined(WIN32) || defined(_MSC_VER) || defined(HAVE_GETIFADDRS)
-    if (iface || ip) {
-        int err = lo_server_set_iface(s, fam, iface, ip);
-        if (err) {
+      if (inet_pton(AF_INET, group, &mreq.imr_multiaddr) == 0) {
+          int err = geterror();
+          lo_throw(s, err, strerror(err), "inet_pton()");
           lo_server_free(s);
-          return err;
+          return err ? err : 1;
+      }
+#else
+      mreq.imr_multiaddr.s_addr = inet_addr(group);
+      if (mreq.imr_multiaddr.s_addr == INADDR_ANY
+          || mreq.imr_multiaddr.s_addr == INADDR_NONE) {
+          int err = geterror();
+          lo_throw(s, err, strerror(err), "inet_addr()");
+          lo_server_free(s);
+          return err ? err : 1;
+      }
+#endif
+#if defined(WIN32) || defined(_MSC_VER) || defined(HAVE_GETIFADDRS)
+      if (iface || ip) {
+          int err = lo_server_set_iface(s, fam, iface, ip);
+          if (err) {
+              lo_server_free(s);
+              return err;
+          }
+
+          mreq.imr_interface = s->addr_if.a.addr;
+          // TODO: the above assignment is for an in_addr, which assumes IPv4
+          //       how to specify group membership interface with IPv6?
+      }
+      else
+#endif // HAVE_GETIFADDRS
+          mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+
+      if (setsockopt(s->sockets[0].fd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+              (char*)&mreq, sizeof(mreq)) < 0) {
+          int err = geterror();
+          lo_throw(s, err, strerror(err), "setsockopt(IP_ADD_MEMBERSHIP)");
+          lo_server_free(s);
+          return err ? err : 1;
+      }
+    }
+        break;
+    case AF_INET6: {
+        struct sockaddr_in6 maddr;
+        struct ipv6_mreq mreq;
+        int ifidx = 0; /* FIXME: select the interface (0=any interface) */
+
+        int hops = 255;
+        int on = 1;
+        if (setsockopt(s->sockets[0].fd, IPPROTO_IPV6, IPV6_MULTICAST_IF, &ifidx, sizeof(ifidx))) {
+            int err = geterror();
+            lo_throw(s, err, strerror(err), "setsockopt(IPv6_MULTICAST_IF)");
+            lo_server_free(s);
+            return err ? err : 1;
         }
 
-        mreq.imr_interface = s->addr_if.a.addr;
-        // TODO: the above assignment is for an in_addr, which assumes IPv4
-        //       how to specify group membership interface with IPv6?
-    }
-    else
-#endif // HAVE_GETIFADDRS
-        mreq.imr_interface.s_addr = htonl(INADDR_ANY);
+        if (setsockopt(s->sockets[0].fd, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &hops, sizeof(hops))) {
+            int err = geterror();
+            lo_throw(s, err, strerror(err), "setsockopt(IPv6_MULTICAST_HOPS)");
+            lo_server_free(s);
+            return err ? err : 1;
+        }
 
-    if (setsockopt(s->sockets[0].fd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
-                   (char*)&mreq, sizeof(mreq)) < 0) {
-        int err = geterror();
-        lo_throw(s, err, strerror(err), "setsockopt(IP_ADD_MEMBERSHIP)");
-        lo_server_free(s);
-        return err ? err : 1;
+        if (setsockopt(s->sockets[0].fd, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &on, sizeof(on))) {
+            int err = geterror();
+            lo_throw(s, err, strerror(err), "setsockopt(IPv6_MULTICAST_LOOP)");
+            lo_server_free(s);
+            return err ? err : 1;
+        }
+        memset(&mreq, 0, sizeof(mreq));
+#ifdef HAVE_INET_PTON
+        memset(&maddr, 0, sizeof(maddr));
+        inet_pton(AF_INET6, group, &maddr.sin6_addr);
+        memcpy(&mreq.ipv6mr_multiaddr, &maddr.sin6_addr, sizeof(mreq.ipv6mr_multiaddr));
+#endif
+        mreq.ipv6mr_interface = ifidx;
+
+        if (setsockopt(s->sockets[0].fd, IPPROTO_IPV6, IPV6_JOIN_GROUP, (char *) &mreq, sizeof(mreq))) {
+            int err = geterror();
+            lo_throw(s, err, strerror(err), "setsockopt(IPv6_JOIN_GROUP)");
+            lo_server_free(s);
+            return err ? err : 1;
+        }
+
+    }
+        break;
+    default:
+        break;
     }
 
     return 0;
